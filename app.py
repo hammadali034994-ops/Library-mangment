@@ -8,14 +8,13 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("LIBRARY_DB_PATH", str(APP_DIR / "library.db")))
-MODEL_NAME = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 st.set_page_config(page_title="Library Management System", page_icon="📚", layout="wide")
 
 
 @contextmanager
-def db_connection():
-    """Open a short-lived SQLite connection and always close it."""
+def database():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
@@ -30,10 +29,9 @@ def db_connection():
         conn.close()
 
 
-def init_db():
-    with db_connection() as conn:
-        conn.executescript(
-            """
+def initialize_database():
+    with database() as conn:
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS books (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -55,74 +53,43 @@ def init_db():
                 FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE RESTRICT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_loans_active
+            CREATE INDEX IF NOT EXISTS idx_loans_book_return
             ON loans(book_id, return_date);
-            CREATE INDEX IF NOT EXISTS idx_loans_due
+
+            CREATE INDEX IF NOT EXISTS idx_loans_due_return
             ON loans(due_date, return_date);
-            """
-        )
+        """)
 
 
-def get_books(search="", category="All"):
+def list_books(search_text="", category="All"):
     sql = """
-        SELECT b.*,
-          b.quantity - (
-            SELECT COUNT(*) FROM loans l
-            WHERE l.book_id = b.id AND l.return_date IS NULL
-          ) AS available,
-          (
-            SELECT COUNT(*) FROM loans l
-            WHERE l.book_id = b.id AND l.return_date IS NULL
-          ) AS borrowed
-        FROM books b
-        WHERE (b.title LIKE ? OR b.author LIKE ? OR COALESCE(b.isbn, '') LIKE ?)
+        SELECT
+            b.id, b.title, b.author, b.isbn, b.category, b.quantity,
+            b.quantity - (
+                SELECT COUNT(*)
+                FROM loans AS l
+                WHERE l.book_id = b.id AND l.return_date IS NULL
+            ) AS available,
+            (
+                SELECT COUNT(*)
+                FROM loans AS l
+                WHERE l.book_id = b.id AND l.return_date IS NULL
+            ) AS borrowed
+        FROM books AS b
+        WHERE (
+            b.title LIKE ? OR
+            b.author LIKE ? OR
+            COALESCE(b.isbn, '') LIKE ?
+        )
     """
-    params = [f"%{search}%", f"%{search}%", f"%{search}%"]
+    params = [f"%{search_text}%", f"%{search_text}%", f"%{search_text}%"]
+
     if category != "All":
         sql += " AND b.category = ?"
         params.append(category)
+
     sql += " ORDER BY b.title COLLATE NOCASE"
-    with db_connection() as conn:
+
+    with database() as conn:
         return conn.execute(sql, params).fetchall()
 
-
-def get_categories():
-    with db_connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT category FROM books ORDER BY category"
-        ).fetchall()
-    return [row["category"] for row in rows]
-
-
-def add_book(title, author, isbn, category, quantity):
-    isbn = isbn.strip() or None
-    with db_connection() as conn:
-        conn.execute(
-            """INSERT INTO books(title, author, isbn, category, quantity)
-               VALUES (?, ?, ?, ?, ?)""",
-            (title.strip(), author.strip(), isbn, category.strip() or "General", quantity),
-        )
-
-
-def update_book(book_id, title, author, isbn, category, quantity):
-    isbn = isbn.strip() or None
-    with db_connection() as conn:
-        active = conn.execute(
-            "SELECT COUNT(*) FROM loans WHERE book_id=? AND return_date IS NULL",
-            (book_id,),
-        ).fetchone()[0]
-        if quantity < active:
-            raise ValueError(
-                f"Quantity cannot be lower than the {active} copy/copies currently on loan."
-            )
-        conn.execute(
-            """UPDATE books SET title=?, author=?, isbn=?, category=?, quantity=?
-               WHERE id=?""",
-            (title.strip(), author.strip(), isbn, category.strip() or "General", quantity, book_id),
-        )
-
-
-def delete_book(book_id):
-    with db_connection() as conn:
-        active = conn.execute(
-            "SELECT COUNT(*) FROM loans WHERE book_id=? AND return_date IS NULL",
